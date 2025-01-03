@@ -179,7 +179,7 @@ int main(int argc, char **argv) {
   //@@ Insert code to call cusparse api to get the buffer size needed by the sparse matrix per
   //@@ vector (SMPV) CSR routine of cuSPARSE
   cusparseCheck(
-    cusparseDcsrmv_bufferSize(
+    cusparseDcsrmvEx_bufferSize(
       cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
       dimX, dimX, nzv, &one,
       Adescriptor, A, ARowPtr, AColIndx,
@@ -196,7 +196,7 @@ int main(int argc, char **argv) {
     //@@ the CSR matrix using cuSPARSE. This calculation corresponds to:
     //@@ tmp = 1 * A * temp + 0 * tmp
     cusparseCheck(
-      cusparseDcsrmv(
+      cusparseDcsrmvEx(
         cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
         dimX, dimX, nzv, &one,
         Adescriptor, A, ARowPtr, AColIndx,
