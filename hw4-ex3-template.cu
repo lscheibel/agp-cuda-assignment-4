@@ -72,6 +72,12 @@ void matrixInit(double* A, int* ArowPtr, int* AcolIndx, int dimX,
   ArowPtr[dimX] = ptr;
 }
 
+double get_time_ms() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (tv.tv_sec * 1000000 + tv.tv_usec) / 1000.0;
+}
+
 int main(int argc, char **argv) {
   int device = 0;            // Device to be used
   int dimX;                  // Dimension of the metal rod
@@ -95,6 +101,10 @@ int main(int argc, char **argv) {
   cublasHandle_t cublasHandle;      // cuBLAS handle
   cusparseHandle_t cusparseHandle;  // cuSPARSE handle
   cusparseMatDescr_t Adescriptor;   // Mat descriptor needed by cuSPARSE
+
+
+  cusparseSpMatDescr_t matA;
+  cusparseDnVecDescr_t vecX, vecY;
 
   // Read the arguments from the command line
   dimX = atoi(argv[1]);
@@ -172,37 +182,63 @@ int main(int argc, char **argv) {
   cublasCheck(cublasSetPointerMode(cublasHandle, CUBLAS_POINTER_MODE_HOST));
 
   //@@ Insert code to call cusparse api to create the mat descriptor used by cuSPARSE
-  cusparseCheck(cusparseCreateMatDescr(&Adescriptor));
-  cusparseCheck(cusparseSetMatType(Adescriptor, CUSPARSE_MATRIX_TYPE_GENERAL));
-  cusparseCheck(cusparseSetMatIndexBase(Adescriptor, CUSPARSE_INDEX_BASE_ZERO));
+  cusparseCheck(cusparseCreateCsr(&matA,               // matrix A descriptor
+                                  dimX,                  // number of rows
+                                  dimX,                  // number of columns
+                                  nzv,                   // number of non-zero elements
+                                  ARowPtr,               // row offsets
+                                  AColIndx,              // column indices
+                                  A,                     // values
+                                  CUSPARSE_INDEX_32I,    // row offsets type
+                                  CUSPARSE_INDEX_32I,    // column indices type
+                                  CUSPARSE_INDEX_BASE_ZERO,  // base index
+                                  CUDA_R_64F));         // values type
+
+  cusparseCheck(cusparseCreateDnVec(&vecX, dimX, temp, CUDA_R_64F));
+  cusparseCheck(cusparseCreateDnVec(&vecY, dimX, tmp, CUDA_R_64F));
 
   //@@ Insert code to call cusparse api to get the buffer size needed by the sparse matrix per
   //@@ vector (SMPV) CSR routine of cuSPARSE
-  cusparseCheck(
-    cusparseDcsrmvEx_bufferSize(
-      cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
-      dimX, dimX, nzv, &one,
-      Adescriptor, A, ARowPtr, AColIndx,
-      temp, &zero, tmp, &bufferSize
-    )
-  );
+  cusparseCheck(cusparseSpMV_bufferSize(cusparseHandle,
+                                        CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                        &one,           // alpha
+                                        matA,           // sparse matrix A
+                                        vecX,           // dense vector x
+                                        &zero,          // beta
+                                        vecY,           // dense vector y
+                                        CUDA_R_64F,     // computation type
+                                        CUSPARSE_SPMV_ALG_DEFAULT,
+                                        &bufferSize));
 
   //@@ Insert code to allocate the buffer needed by cuSPARSE
   gpuCheck(cudaMalloc(&buffer, bufferSize));
 
+  double total_spmv_time = 0.0;
+  int spmv_calls = 0;
+
   // Perform the time step iterations
   for (int it = 0; it < nsteps; ++it) {
+    double start = get_time_ms();
+
     //@@ Insert code to call cusparse api to compute the SMPV (sparse matrix multiplication) for
     //@@ the CSR matrix using cuSPARSE. This calculation corresponds to:
     //@@ tmp = 1 * A * temp + 0 * tmp
-    cusparseCheck(
-      cusparseDcsrmvEx(
-        cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
-        dimX, dimX, nzv, &one,
-        Adescriptor, A, ARowPtr, AColIndx,
-        temp, &zero, tmp
-      )
-    );
+    cusparseCheck(cusparseSpMV(cusparseHandle,
+                              CUSPARSE_OPERATION_NON_TRANSPOSE,
+                              &one,           // alpha
+                              matA,           // sparse matrix A
+                              vecX,           // dense vector x
+                              &zero,          // beta
+                              vecY,           // dense vector y
+                              CUDA_R_64F,     // computation type
+                              CUSPARSE_SPMV_ALG_DEFAULT,
+                              buffer));       // external buffer
+
+
+    cudaDeviceSynchronize();
+    double end = get_time_ms();
+    total_spmv_time += (end - start);
+    spmv_calls++;
 
     //@@ Insert code to call cublas api to compute the axpy routine using cuBLAS.
     //@@ This calculation corresponds to: temp = alpha * tmp + temp
@@ -217,6 +253,15 @@ int main(int argc, char **argv) {
       break;
   }
 
+
+  // After the loop, calculate and print performance metrics
+  double avg_time_ms = total_spmv_time / spmv_calls;
+  // Each SPMV does 2*nzv operations (multiply + add for each non-zero)
+  double gflops = (2.0 * nzv * spmv_calls) / (total_spmv_time * 1e-3) / 1e9;
+  printf("SPMV Performance:\n");
+  printf("Average time per SPMV: %.3f ms\n", avg_time_ms);
+  printf("GFLOPS: %.2f\n", gflops);
+
   // Calculate the exact solution using thrust
   thrust::device_ptr<double> thrustPtr(tmp);
   thrust::sequence(thrustPtr, thrustPtr + dimX, tempLeft,
@@ -227,7 +272,7 @@ int main(int argc, char **argv) {
   //@@ Insert the code to call cublas api to compute the difference between the exact solution
   //@@ and the approximation
   //@@ This calculation corresponds to: tmp = -temp + tmp
-  cublasCheck(cublasDaxpy(cublasHandle, dimX, &one, temp, 1, tmp, 1));
+  cublasCheck(cublasDaxpy(cublasHandle, dimX, &one, temp, 1, tmp, 1)); 
 
   //@@ Insert the code to call cublas api to compute the norm of the absolute error
   //@@ This calculation corresponds to: || tmp ||
@@ -243,7 +288,9 @@ int main(int argc, char **argv) {
   printf("The relative error of the approximation is %f\n", error);
 
   //@@ Insert the code to destroy the mat descriptor
-  cusparseCheck(cusparseDestroyMatDescr(Adescriptor));
+  cusparseCheck(cusparseDestroySpMat(matA));
+  cusparseCheck(cusparseDestroyDnVec(vecX));
+  cusparseCheck(cusparseDestroyDnVec(vecY));
 
   //@@ Insert the code to destroy the cuSPARSE handle
   cusparseCheck(cusparseDestroy(cusparseHandle));
